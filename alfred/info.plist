@@ -148,7 +148,7 @@ Notes: the endpoint rate-limits hard, so results are cached ~180s. If the beta h
 		<string></string>
 	</dict>
 	<key>version</key>
-	<string>1.0.0</string>
+	<string>1.0.1</string>
 	<key>webaddress</key>
 	<string>https://narayann.dev</string>
 </dict>
