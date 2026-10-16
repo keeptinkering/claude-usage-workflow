@@ -45,7 +45,12 @@ icon and no main window. Look for `W .. . C ..` near the clock.
 ## States
 
 - No login: title shows `Claude !`, popover explains how to sign in.
-- Expired token (401) or rate limit (429): last good data stays, marked stale.
+- Expired token: the app runs `claude auth status` so Claude Code renews its own
+  login, re-reads the Keychain, and retries once. If that still fails (401), last
+  good data stays, marked stale, and the popover asks you to sign in again.
+- Rate limit (429) or network error: last good data stays, marked stale.
+- Keychain and CLI calls run off the main thread with timeouts, so a pending
+  Keychain prompt or a slow CLI never freezes the menu bar.
 - First load: title shows `Claude ...`.
 
 ## Configuration

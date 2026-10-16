@@ -19,12 +19,14 @@ enum UsageError: Error, LocalizedError {
     case unauthorized
     case rateLimited
     case http(Int)
+    case network
     case decode
 
     var errorDescription: String? {
         switch self {
         case .noToken:      return "No Claude Code login"
         case .unauthorized: return "Login expired (401)"
+        case .network:      return "Network error"
         case .rateLimited:  return "Rate limited (429)"
         case .http(let c):  return "HTTP error (\(c))"
         case .decode:       return "Could not read response"
@@ -41,6 +43,9 @@ func fetchUsage(token: String, userAgent: String) async throws -> UsageResponse 
     req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
     req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
     req.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+    // URLSession's default is 60s per request; fail fast so the spinner and the
+    // Refresh button come back promptly when offline.
+    req.timeoutInterval = 15
 
     let (data, resp) = try await URLSession.shared.data(for: req)
     guard let http = resp as? HTTPURLResponse else { throw UsageError.decode }

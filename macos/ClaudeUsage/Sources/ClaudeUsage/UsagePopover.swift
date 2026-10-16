@@ -59,6 +59,11 @@ struct UsagePopover: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            if case .unauthorized = model.lastError {
+                Text("Run `claude` and sign in again, then refresh.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
     }
 

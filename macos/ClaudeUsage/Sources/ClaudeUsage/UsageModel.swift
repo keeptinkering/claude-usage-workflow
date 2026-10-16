@@ -33,6 +33,7 @@ final class UsageModel: ObservableObject {
 
     private var timer: Timer?
     private var lastGoodAt: Date?
+    private var detectedUserAgent: String?
 
     // Config, read from UserDefaults with built-in defaults. There is no
     // in-app Settings UI; advanced users can override via `defaults write`.
@@ -44,10 +45,15 @@ final class UsageModel: ObservableObject {
         let v = UserDefaults.standard.integer(forKey: ConfigKey.cacheSeconds)
         return v > 0 ? v : 180
     }
-    private var userAgent: String {
+    /// User-Agent override, else the CLI version detected once (off the main
+    /// actor) and reused, instead of spawning `claude --version` every refresh.
+    private func resolveUserAgent() async -> String {
         let v = UserDefaults.standard.string(forKey: ConfigKey.userAgent)
         if let v = v, !v.isEmpty { return v }
-        return UserAgentDetector.detect()
+        if let ua = detectedUserAgent { return ua }
+        let ua = await Task.detached { UserAgentDetector.detect() }.value
+        detectedUserAgent = ua
+        return ua
     }
 
     init() {
@@ -84,12 +90,16 @@ final class UsageModel: ObservableObject {
 
     /// Fetch fresh usage. On success, replace state. On failure, keep the last
     /// good numbers and flag them stale (except no-token, which clears state).
+    ///
+    /// Expired login recovery: if the stored token is past its expiry, or the
+    /// endpoint answers 401, ask Claude Code to refresh its login, re-read the
+    /// store, and retry once with the new token.
     func refresh() async {
         if isLoading { return }
         isLoading = true
         defer { isLoading = false }
 
-        guard let token = TokenStore.resolveToken() else {
+        guard var creds = await Self.readCredentials() else {
             lastError = .noToken
             session = nil
             weekly = nil
@@ -98,8 +108,25 @@ final class UsageModel: ObservableObject {
             return
         }
 
+        var refreshed = false
+        if creds.isExpired, let fresh = await Self.refreshAndReread() {
+            creds = fresh
+            refreshed = true
+        }
+
+        let userAgent = await resolveUserAgent()
+
         do {
-            let resp = try await fetchUsage(token: token, userAgent: userAgent)
+            let resp: UsageResponse
+            do {
+                resp = try await fetchUsage(token: creds.accessToken, userAgent: userAgent)
+            } catch UsageError.unauthorized where !refreshed {
+                guard let fresh = await Self.refreshAndReread(),
+                      fresh.accessToken != creds.accessToken else {
+                    throw UsageError.unauthorized
+                }
+                resp = try await fetchUsage(token: fresh.accessToken, userAgent: userAgent)
+            }
             session = WindowState(pct: percent(from: resp.five_hour.utilization),
                                   resetsAt: resp.five_hour.resets_at)
             weekly = WindowState(pct: percent(from: resp.seven_day.utilization),
@@ -119,9 +146,24 @@ final class UsageModel: ObservableObject {
             // Keep last-good on transient errors; mark stale if we have data.
             isStale = (session != nil || weekly != nil)
         } catch {
-            lastError = .decode
+            lastError = .network
             isStale = (session != nil || weekly != nil)
         }
+    }
+
+    // MARK: Off-main helpers
+
+    /// Reads the stored login without blocking the main actor.
+    private static func readCredentials() async -> StoredCredentials? {
+        await Task.detached { TokenStore.resolve() }.value
+    }
+
+    /// Runs the CLI login refresh, then re-reads the store, off the main actor.
+    private static func refreshAndReread() async -> StoredCredentials? {
+        await Task.detached {
+            LoginRefresher.refresh()
+            return TokenStore.resolve()
+        }.value
     }
 }
 
@@ -138,31 +180,10 @@ enum UserAgentDetector {
 
     /// Runs `claude --version` and extracts a version number, e.g. "1.2.3".
     private static func cliVersion() -> String? {
-        let candidates = [
-            "/opt/homebrew/bin/claude",
-            "/usr/local/bin/claude",
-            "\(NSHomeDirectory())/.local/bin/claude"
-        ]
-        guard let path = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
-            return nil
-        }
-
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: path)
-        task.arguments = ["--version"]
-        let pipe = Pipe()
-        task.standardOutput = pipe
-        task.standardError = Pipe()
-        do {
-            try task.run()
-            task.waitUntilExit()
-        } catch {
-            return nil
-        }
-        guard task.terminationStatus == 0 else { return nil }
-
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        guard let out = String(data: data, encoding: .utf8) else { return nil }
+        guard let path = ClaudeCLI.path,
+              let result = ProcessRunner.run(path, ["--version"], timeout: 10),
+              result.status == 0,
+              let out = String(data: result.stdout, encoding: .utf8) else { return nil }
         // Match the first dotted version token like 1.2.3.
         if let range = out.range(of: #"\d+\.\d+\.\d+"#, options: .regularExpression) {
             return String(out[range])

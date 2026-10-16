@@ -62,6 +62,19 @@ resolved in this order:
 
 Nothing leaves your machine except the request to `api.anthropic.com`.
 
+### Expired login
+
+The access token is short-lived. Claude Code renews it with a single-use
+refresh token, but only while the CLI runs, so a menu bar or launcher can be
+left holding an expired token. When the stored token is past its `expiresAt`,
+or the endpoint answers `401`, the core runs `claude auth status`, which lets
+Claude Code renew and save its own login, then re-reads the store and retries
+once. The refresh token itself is never read or used here: spending it without
+writing the result back would sign you out of Claude Code.
+
+Set `CC_CLAUDE_BIN` if the CLI lives somewhere other than `~/.local/bin`,
+`~/.claude/local`, `/opt/homebrew/bin`, or `/usr/local/bin`.
+
 ### Caching
 
 The endpoint rate-limits hard, and once throttled it can stay `429` for a
@@ -136,7 +149,7 @@ Each usage window becomes one Alfred row. The session and weekly rows are
 |---|---|---|
 | "Node not found" | Alfred's minimal PATH | Install Node, or add its bin dir to the shim's PATH |
 | "No Claude Code login found" | Not signed in, or token stored elsewhere | Run `claude` and sign in |
-| `401` | Token expired, or the beta header changed | Open Claude Code once to refresh; update `oauth-2025-04-20` if Anthropic bumped it |
+| `401` | Login expired and the automatic refresh could not renew it, or the beta header changed | Run `claude` and sign in again; update `oauth-2025-04-20` if Anthropic bumped it |
 | `429` | Endpoint throttling | Wait a few minutes; cached results are served meanwhile |
 
 ---
