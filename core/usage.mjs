@@ -12,7 +12,7 @@
 
 import { execFileSync } from "node:child_process";
 import { readFileSync, writeFileSync, statSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { homedir, tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 
 // -- constants ---------------------------------------------------------------
@@ -67,6 +67,7 @@ const defaultTokenDeps = {
   execFileSync,
   readFileSync,
   homedir,
+  username: () => process.env.USER || userInfo().username,
 };
 
 // Pull the OAuth record out of the stored blob. The documented path is
@@ -102,16 +103,24 @@ function extractCredentials(jsonBlob) {
 export async function readCredentials(deps = {}) {
   const d = { ...defaultTokenDeps, ...deps };
 
-  // 1. Keychain
-  try {
-    const blob = d.execFileSync(
-      "security",
-      ["find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"],
-      { encoding: "utf8", timeout: KEYCHAIN_TIMEOUT_MS }
-    );
-    return extractCredentials(blob);
-  } catch {
-    // fall through to file
+  // 1. Keychain. Several items can share the service name (an old login, or
+  // another tool writing there), and a bare `-s` lookup returns whichever
+  // comes first. Claude Code itself keys its item by the macOS username, so
+  // ask for that account first and only then fall back to any match.
+  const lookups = [
+    ["find-generic-password", "-a", d.username(), "-s", KEYCHAIN_SERVICE, "-w"],
+    ["find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"],
+  ];
+  for (const args of lookups) {
+    try {
+      const blob = d.execFileSync("security", args, {
+        encoding: "utf8",
+        timeout: KEYCHAIN_TIMEOUT_MS,
+      });
+      return extractCredentials(blob);
+    } catch {
+      // try the next lookup, then the file
+    }
   }
 
   // 2. Credentials file
@@ -420,6 +429,7 @@ export async function getUsage(opts = {}) {
     execFileSync: d.execFileSync,
     readFileSync: d.readFileSync,
     homedir: d.homedir,
+    ...(d.username ? { username: d.username } : {}),
   };
   const refreshAndReread = async () => {
     refreshLogin({ execFileSync: d.execFileSync, homedir: d.homedir, env });

@@ -33,17 +33,28 @@ enum TokenStore {
 
     // MARK: Keychain (via `security` CLI)
 
+    /// Several items can share the service name (an old login, or another tool
+    /// writing there), and a bare `-s` lookup returns whichever comes first.
+    /// Claude Code keys its item by the macOS username, so ask for that account
+    /// first and only then fall back to any match.
     private static func credentialsFromKeychain() -> StoredCredentials? {
-        guard let out = ProcessRunner.run(
-            "/usr/bin/security",
-            ["find-generic-password", "-s", "Claude Code-credentials", "-w"],
-            timeout: 10
-        ), out.status == 0 else { return nil }
+        let service = "Claude Code-credentials"
+        let lookups = [
+            ["find-generic-password", "-a", NSUserName(), "-s", service, "-w"],
+            ["find-generic-password", "-s", service, "-w"]
+        ]
+        for args in lookups {
+            if let creds = keychainLookup(args) { return creds }
+        }
+        return nil
+    }
 
-        guard let raw = String(data: out.stdout, encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-            !raw.isEmpty else { return nil }
-
+    private static func keychainLookup(_ args: [String]) -> StoredCredentials? {
+        guard let out = ProcessRunner.run("/usr/bin/security", args, timeout: 10),
+              out.status == 0,
+              let raw = String(data: out.stdout, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty else { return nil }
         return parse(Data(raw.utf8))
     }
 

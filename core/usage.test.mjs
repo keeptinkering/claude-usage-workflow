@@ -420,3 +420,31 @@ test("getUsage: 401 with no new token surfaces UnauthorizedError after one refre
   assert.equal(calls, 1);
   assert.equal(store.cliCalls, 1);
 });
+
+test("readCredentials: prefers the item for the current user over a stale duplicate", async () => {
+  const c = await readCredentials({
+    username: () => "narayan",
+    homedir: () => "/home/test",
+    execFileSync: (_cmd, args) => {
+      if (args.includes("-a")) {
+        assert.equal(args[args.indexOf("-a") + 1], "narayan");
+        return blob("live", null);
+      }
+      // A bare -s lookup hits the stale item with no OAuth record.
+      return JSON.stringify({ mcpOAuth: {} });
+    },
+  });
+  assert.equal(c.token, "live");
+});
+
+test("readCredentials: falls back to a bare service lookup", async () => {
+  const c = await readCredentials({
+    username: () => "narayan",
+    homedir: () => "/home/test",
+    execFileSync: (_cmd, args) => {
+      if (args.includes("-a")) throw new Error("not found");
+      return blob("any", null);
+    },
+  });
+  assert.equal(c.token, "any");
+});
