@@ -15,6 +15,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT="$ROOT/.build"
+mkdir -p "$OUT"
 
 log()  { printf '==> %s\n' "$*"; }
 step() { printf '    %s\n' "$*"; }
@@ -74,7 +75,10 @@ build_raycast() {
     ( cd "$dir" && npm install --silent )
   fi
 
-  # ray build validates + vendors core via the prebuild copy step.
+  # `npx ray build` skips the npm prebuild hook, so vendor the core here.
+  step "vendor core"
+  ( cd "$dir" && node scripts/copy-core.mjs >/dev/null )
+
   step "ray build (validate)"
   ( cd "$dir" && npx --no-install ray build ) || { echo "ray build failed"; return 1; }
 
