@@ -76,7 +76,7 @@ export function reasonFor(error: unknown): string {
     return "No Claude Code login";
   }
   if (name === "UnauthorizedError") {
-    return "Token expired, open Claude Code";
+    return "Login expired, run `claude` to sign in";
   }
   if (name === "RateLimitedError") {
     return "Rate limited, retry soon";

@@ -12,6 +12,9 @@ import {
   resetLocal,
   summaryLine,
   readToken,
+  readCredentials,
+  isExpired,
+  refreshLogin,
   fetchRaw,
   getUsage,
   parseUsage,
@@ -267,4 +270,181 @@ test("getUsage: 429 with no cache rethrows RateLimitedError", async () => {
     () => getUsage({ deps, env: {}, cacheFile: "/x/ccu-usage.json" }),
     RateLimitedError
   );
+});
+
+// -- expired login recovery -------------------------------------------------
+
+function blob(accessToken, expiresAt) {
+  return JSON.stringify({ claudeAiOauth: { accessToken, expiresAt } });
+}
+
+// A fake keychain + CLI: `security` returns the current blob, `claude auth
+// status` swaps in the refreshed blob (what Claude Code does on refresh).
+function fakeStore(initial, afterRefresh) {
+  const state = { blob: initial, cliCalls: 0 };
+  state.execFileSync = (cmd, args) => {
+    if (cmd === "security") return state.blob;
+    if (args && args[0] === "auth") {
+      state.cliCalls += 1;
+      if (afterRefresh) state.blob = afterRefresh;
+      return "{}";
+    }
+    throw new Error(`unexpected exec ${cmd}`);
+  };
+  return state;
+}
+
+function noCacheDeps(store, fetch) {
+  return {
+    statSync: () => {
+      throw new Error("no cache file");
+    },
+    readFileSync: () => {
+      throw new Error("no file");
+    },
+    writeFileSync: () => {},
+    fetch,
+    execFileSync: store.execFileSync,
+    homedir: () => "/home/test",
+  };
+}
+
+test("readCredentials: returns token and expiry", async () => {
+  const c = await readCredentials({
+    execFileSync: () => blob("tok-1", 1234),
+    homedir: () => "/home/test",
+  });
+  assert.deepEqual(c, { token: "tok-1", expiresAt: 1234 });
+});
+
+test("readCredentials: accepts an accessToken under another top-level key", async () => {
+  const c = await readCredentials({
+    execFileSync: () => JSON.stringify({ other: { accessToken: "tok-2" } }),
+    homedir: () => "/home/test",
+  });
+  assert.equal(c.token, "tok-2");
+  assert.equal(c.expiresAt, null);
+});
+
+test("readCredentials: passes a timeout to the keychain read", async () => {
+  let opts;
+  await readCredentials({
+    execFileSync: (_cmd, _args, o) => {
+      opts = o;
+      return TOKEN_BLOB;
+    },
+    homedir: () => "/home/test",
+  });
+  assert.ok(opts.timeout > 0);
+});
+
+test("isExpired: past, near-future, future, unknown", () => {
+  const now = 1_000_000_000;
+  assert.equal(isExpired(now - 1, now), true);
+  assert.equal(isExpired(now + 30_000, now), true); // inside skew
+  assert.equal(isExpired(now + 3_600_000, now), false);
+  assert.equal(isExpired(null, now), false);
+});
+
+test("refreshLogin: skips missing binaries and runs `claude auth status`", () => {
+  const seen = [];
+  const ok = refreshLogin({
+    env: {},
+    homedir: () => "/home/test",
+    execFileSync: (bin, args) => {
+      seen.push(bin);
+      if (bin !== "/opt/homebrew/bin/claude") {
+        const e = new Error("not found");
+        e.code = "ENOENT";
+        throw e;
+      }
+      assert.deepEqual(args, ["auth", "status"]);
+      return "{}";
+    },
+  });
+  assert.equal(ok, true);
+  assert.equal(seen.at(-1), "/opt/homebrew/bin/claude");
+});
+
+test("refreshLogin: returns false when no CLI is installed", () => {
+  const ok = refreshLogin({
+    env: {},
+    homedir: () => "/home/test",
+    execFileSync: () => {
+      const e = new Error("not found");
+      e.code = "ENOENT";
+      throw e;
+    },
+  });
+  assert.equal(ok, false);
+});
+
+test("getUsage: 401 refreshes the login and retries with the new token", async () => {
+  const store = fakeStore(blob("old", null), blob("new", null));
+  const tokens = [];
+  const deps = noCacheDeps(store, async (_url, init) => {
+    const t = init.headers.Authorization;
+    tokens.push(t);
+    return t === "Bearer new" ? fakeResponse(200, RAW) : fakeResponse(401, {});
+  });
+  const r = await getUsage({ deps, env: {}, cacheFile: "/x/ccu-usage.json" });
+  assert.equal(r.cached, false);
+  assert.equal(r.fiveHour.pct, 18);
+  assert.deepEqual(tokens, ["Bearer old", "Bearer new"]);
+  assert.equal(store.cliCalls, 1);
+});
+
+test("getUsage: expired token is refreshed before the first request", async () => {
+  const store = fakeStore(blob("old", Date.now() - 1000), blob("new", Date.now() + 3_600_000));
+  const tokens = [];
+  const deps = noCacheDeps(store, async (_url, init) => {
+    tokens.push(init.headers.Authorization);
+    return fakeResponse(200, RAW);
+  });
+  await getUsage({ deps, env: {}, cacheFile: "/x/ccu-usage.json" });
+  assert.deepEqual(tokens, ["Bearer new"]);
+  assert.equal(store.cliCalls, 1);
+});
+
+test("getUsage: 401 with no new token surfaces UnauthorizedError after one refresh", async () => {
+  const store = fakeStore(blob("old", null), null);
+  let calls = 0;
+  const deps = noCacheDeps(store, async () => {
+    calls += 1;
+    return fakeResponse(401, {});
+  });
+  await assert.rejects(
+    () => getUsage({ deps, env: {}, cacheFile: "/x/ccu-usage.json" }),
+    UnauthorizedError
+  );
+  assert.equal(calls, 1);
+  assert.equal(store.cliCalls, 1);
+});
+
+test("readCredentials: prefers the item for the current user over a stale duplicate", async () => {
+  const c = await readCredentials({
+    username: () => "narayan",
+    homedir: () => "/home/test",
+    execFileSync: (_cmd, args) => {
+      if (args.includes("-a")) {
+        assert.equal(args[args.indexOf("-a") + 1], "narayan");
+        return blob("live", null);
+      }
+      // A bare -s lookup hits the stale item with no OAuth record.
+      return JSON.stringify({ mcpOAuth: {} });
+    },
+  });
+  assert.equal(c.token, "live");
+});
+
+test("readCredentials: falls back to a bare service lookup", async () => {
+  const c = await readCredentials({
+    username: () => "narayan",
+    homedir: () => "/home/test",
+    execFileSync: (_cmd, args) => {
+      if (args.includes("-a")) throw new Error("not found");
+      return blob("any", null);
+    },
+  });
+  assert.equal(c.token, "any");
 });

@@ -12,7 +12,7 @@
 
 import { execFileSync } from "node:child_process";
 import { readFileSync, writeFileSync, statSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { homedir, tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 
 // -- constants ---------------------------------------------------------------
@@ -25,6 +25,16 @@ export const KEYCHAIN_SERVICE = "Claude Code-credentials";
 // constant so a single bump covers every surface.
 const PINNED_VERSION = "1.0.0";
 const DEFAULT_CACHE_SECONDS = 180;
+
+// Hard ceilings so a hung keychain prompt, CLI, or socket can never wedge a
+// refresh. Without these an expired login could leave the UI stuck forever.
+const KEYCHAIN_TIMEOUT_MS = 10_000;
+const FETCH_TIMEOUT_MS = 15_000;
+const CLI_REFRESH_TIMEOUT_MS = 30_000;
+
+// Treat a token this close to expiry as already expired, so we refresh before
+// the request instead of eating a 401 first.
+const EXPIRY_SKEW_MS = 60_000;
 
 // -- typed errors ------------------------------------------------------------
 
@@ -57,49 +67,152 @@ const defaultTokenDeps = {
   execFileSync,
   readFileSync,
   homedir,
+  username: () => process.env.USER || userInfo().username,
 };
 
-function extractToken(jsonBlob) {
+// Pull the OAuth record out of the stored blob. The documented path is
+// .claudeAiOauth; any other top-level object holding an accessToken is accepted
+// too, so a renamed key does not read as "not logged in".
+function extractCredentials(jsonBlob) {
   const parsed = JSON.parse(jsonBlob);
-  const token = parsed?.claudeAiOauth?.accessToken;
-  if (typeof token !== "string" || token.length === 0) {
-    throw new Error("token path .claudeAiOauth.accessToken missing");
+  const candidates = [
+    parsed?.claudeAiOauth,
+    ...Object.values(parsed ?? {}),
+  ];
+  for (const c of candidates) {
+    const token = c?.accessToken;
+    if (typeof token === "string" && token.length > 0) {
+      const expiresAt = Number(c.expiresAt);
+      return {
+        token,
+        expiresAt: Number.isFinite(expiresAt) && expiresAt > 0 ? expiresAt : null,
+      };
+    }
   }
-  return token;
+  throw new Error("no accessToken in credentials blob");
 }
 
 /**
- * Resolve the OAuth access token.
- * Order: macOS Keychain, then ~/.claude/.credentials.json. Throws NoTokenError
- * if both fail.
+ * Resolve the OAuth credentials (access token plus expiry, when stored).
+ * Order: macOS Keychain, then ~/.claude/.credentials.json. Re-read on every
+ * call so a token Claude Code refreshed in the meantime is picked up. Throws
+ * NoTokenError if both fail.
  * @param {{ execFileSync?:Function, readFileSync?:Function, homedir?:Function }} [deps]
- * @returns {Promise<string>}
+ * @returns {Promise<{ token:string, expiresAt:number|null }>}
  */
-export async function readToken(deps = {}) {
+export async function readCredentials(deps = {}) {
   const d = { ...defaultTokenDeps, ...deps };
 
-  // 1. Keychain
-  try {
-    const blob = d.execFileSync(
-      "security",
-      ["find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"],
-      { encoding: "utf8" }
-    );
-    return extractToken(blob);
-  } catch {
-    // fall through to file
+  // 1. Keychain. Several items can share the service name (an old login, or
+  // another tool writing there), and a bare `-s` lookup returns whichever
+  // comes first. Claude Code itself keys its item by the macOS username, so
+  // ask for that account first and only then fall back to any match.
+  const lookups = [
+    ["find-generic-password", "-a", d.username(), "-s", KEYCHAIN_SERVICE, "-w"],
+    ["find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"],
+  ];
+  for (const args of lookups) {
+    try {
+      const blob = d.execFileSync("security", args, {
+        encoding: "utf8",
+        timeout: KEYCHAIN_TIMEOUT_MS,
+      });
+      return extractCredentials(blob);
+    } catch {
+      // try the next lookup, then the file
+    }
   }
 
   // 2. Credentials file
   try {
     const path = join(d.homedir(), ".claude", ".credentials.json");
     const blob = d.readFileSync(path, "utf8");
-    return extractToken(blob);
+    return extractCredentials(blob);
   } catch {
     // fall through to throw
   }
 
   throw new NoTokenError();
+}
+
+/**
+ * Resolve just the OAuth access token. See readCredentials.
+ * @param {{ execFileSync?:Function, readFileSync?:Function, homedir?:Function }} [deps]
+ * @returns {Promise<string>}
+ */
+export async function readToken(deps = {}) {
+  return (await readCredentials(deps)).token;
+}
+
+/**
+ * True when the stored expiry is in the past (or within the skew window).
+ * Unknown expiry counts as not expired; the endpoint's 401 is the backstop.
+ * @param {number|null} expiresAt epoch ms
+ * @param {number} [now] epoch ms
+ * @returns {boolean}
+ */
+export function isExpired(expiresAt, now = Date.now()) {
+  if (!expiresAt) return false;
+  return expiresAt - EXPIRY_SKEW_MS <= now;
+}
+
+// -- login refresh -----------------------------------------------------------
+
+/**
+ * Candidate paths for the Claude Code CLI. GUI launchers (Alfred, Raycast, a
+ * menu bar app) start with a minimal PATH, so common install dirs are tried
+ * explicitly before falling back to a bare `claude` on PATH.
+ * @param {Record<string,string|undefined>} env
+ * @param {string} home
+ * @returns {string[]}
+ */
+export function claudeCandidates(env, home) {
+  const list = [];
+  if (env.CC_CLAUDE_BIN) list.push(env.CC_CLAUDE_BIN);
+  list.push(
+    join(home, ".local", "bin", "claude"),
+    join(home, ".claude", "local", "claude"),
+    "/opt/homebrew/bin/claude",
+    "/usr/local/bin/claude",
+    "claude"
+  );
+  return list;
+}
+
+/**
+ * Ask the Claude Code CLI to bring its own login up to date.
+ *
+ * The OAuth refresh token is single-use and owned by Claude Code. Refreshing
+ * it here and failing to write it back would sign the user out of Claude Code
+ * itself, so this app never touches the refresh token. Instead it runs
+ * `claude auth status`, which loads (and if needed refreshes and saves) the
+ * stored login, then the caller re-reads the store.
+ *
+ * Best-effort: returns true if some candidate ran, false otherwise. Never
+ * throws.
+ * @param {{ execFileSync?:Function, homedir?:Function, env?:object }} [deps]
+ * @returns {boolean}
+ */
+export function refreshLogin(deps = {}) {
+  const d = { ...defaultTokenDeps, ...deps };
+  const env = d.env || process.env;
+  for (const bin of claudeCandidates(env, d.homedir())) {
+    try {
+      d.execFileSync(bin, ["auth", "status"], {
+        encoding: "utf8",
+        timeout: CLI_REFRESH_TIMEOUT_MS,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      return true;
+    } catch (err) {
+      // ENOENT means this candidate is not installed; try the next one. Any
+      // other failure (non-zero exit, timeout) means the CLI ran but could not
+      // help, so stop.
+      if (err && err.code === "ENOENT") continue;
+      return true;
+    }
+  }
+  return false;
 }
 
 // -- user agent --------------------------------------------------------------
@@ -142,6 +255,7 @@ export async function fetchRaw(token, userAgent, deps = {}) {
       "anthropic-beta": BETA_HEADER,
       "User-Agent": userAgent,
     },
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
   });
 
   if (res.status === 200) {
@@ -284,6 +398,11 @@ const defaultUsageDeps = {
 
 /**
  * Full flow: cache, then token, fetch, parse, cache.
+ *
+ * Expired login recovery: if the stored token is past its expiry, or the
+ * endpoint answers 401, ask Claude Code to refresh its login, re-read the
+ * store, and retry once with the new token. If the token did not change the
+ * UnauthorizedError is surfaced so the UI can tell the user to sign in again.
  * @param {{ userAgent?:string, cacheSeconds?:number, cacheFile?:string, env?:object, deps?:object }} [opts]
  * @returns {Promise<{fiveHour:object, sevenDay:object, sevenDaySonnet:object, cached:boolean}>}
  */
@@ -306,15 +425,35 @@ export async function getUsage(opts = {}) {
   }
 
   // 2. Token, then fetch.
-  const token = await readToken({
+  const tokenDeps = {
     execFileSync: d.execFileSync,
     readFileSync: d.readFileSync,
     homedir: d.homedir,
-  });
+    ...(d.username ? { username: d.username } : {}),
+  };
+  const refreshAndReread = async () => {
+    refreshLogin({ execFileSync: d.execFileSync, homedir: d.homedir, env });
+    return readCredentials(tokenDeps);
+  };
+
+  let creds = await readCredentials(tokenDeps);
+  let refreshed = false;
+  if (isExpired(creds.expiresAt)) {
+    creds = await refreshAndReread();
+    refreshed = true;
+  }
 
   let raw;
   try {
-    raw = await fetchRaw(token, userAgent, { fetch: d.fetch });
+    try {
+      raw = await fetchRaw(creds.token, userAgent, { fetch: d.fetch });
+    } catch (err) {
+      if (!(err instanceof UnauthorizedError) || refreshed) throw err;
+      const before = creds.token;
+      creds = await refreshAndReread();
+      if (creds.token === before) throw err;
+      raw = await fetchRaw(creds.token, userAgent, { fetch: d.fetch });
+    }
   } catch (err) {
     // On 429, serve any cache we can find regardless of freshness.
     if (err instanceof RateLimitedError) {

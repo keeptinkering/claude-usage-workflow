@@ -71,8 +71,8 @@ main().catch((err) => {
     title = "No Claude Code login found";
     subtitle = "Run `claude` and sign in, then try again.";
   } else if (err instanceof UnauthorizedError) {
-    title = "Unauthorized (401)";
-    subtitle = "Open Claude Code to refresh, or the beta header changed.";
+    title = "Claude Code login expired (401)";
+    subtitle = "Automatic refresh failed. Run `claude` and sign in again.";
   } else if (err instanceof RateLimitedError) {
     title = "Rate limited (429)";
     subtitle = "Endpoint is throttling. Wait a few minutes and retry.";

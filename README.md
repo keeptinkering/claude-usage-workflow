@@ -82,7 +82,7 @@ The usage numbers are not computed locally. They come from an undocumented, beta
 GET https://api.anthropic.com/api/oauth/usage
 ```
 
-Your OAuth token is read from the macOS Keychain (`Claude Code-credentials`), falling back to `~/.claude/.credentials.json`. Responses are cached for about 180 seconds to stay clear of rate limits. Nothing leaves your machine except the request to `api.anthropic.com`. Full details in [`docs/core.md`](docs/core.md).
+Your OAuth token is read from the macOS Keychain (`Claude Code-credentials`), falling back to `~/.claude/.credentials.json`. Responses are cached for about 180 seconds to stay clear of rate limits. When the login expires, the app asks the Claude Code CLI (`claude auth status`) to renew it and retries once. Nothing leaves your machine except the request to `api.anthropic.com`. Full details in [`docs/core.md`](docs/core.md).
 
 ## Caveats
 
